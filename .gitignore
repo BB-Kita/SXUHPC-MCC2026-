@@ -1,0 +1,22 @@
+# .gitignore
+
+# 气象数据文件 (NetCDF)
+*.nc
+Newdata/
+ERA5/
+
+# 编译目录与二进制文件
+build/
+*.o
+*.out
+*.exe
+mcc_baseline
+
+# 超算 Slurm 日志文件
+slurm-*.out
+slurm-*.err
+baseline_run_*.out
+baseline_run_*.err
+
+# 编辑器与系统缓存
+.vscode/ .idea/ .DS_Store

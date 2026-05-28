@@ -27,16 +27,6 @@ __global__ void ocean_heatwave_kernel(const float* d_in, float* d_out_mean, floa
         d_out_p90[local_offset] = p90_val;
     }
 }
-__global__ void ocean_heatwave_kernel(const float* d_in, float* d_out_mean, float* d_out_p90, int lat_start, int lat_end) {
-    int lon_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int lat_idx_local = blockIdx.y * blockDim.y + threadIdx.y;
-    int lat_idx_global = lat_start + lat_idx_local;
-
-    // 边界保护
-    if (lon_idx < LON_SIZE && lat_idx_global < lat_end) {
-        // TODO: 负责算法的队员在这里实现共享内存或免排序的 P90 逻辑
-    }
-}
 
 void dispatch_to_4_dcus(float* h_sst_data) {
     const int NUM_GPUS = 4;

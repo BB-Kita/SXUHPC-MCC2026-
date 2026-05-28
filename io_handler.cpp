@@ -38,10 +38,9 @@
 #define TARGET_DOY 152
 #endif
 
-// NetCDF 并发读不要盲目打满 32 核，建议先用 4 或 8。
-// 如果确认文件系统和 NetCDF/HDF5 环境稳定，再加大。
+// NetCDF 并发
 #ifndef IO_THREADS
-#define IO_THREADS 4
+#define IO_THREADS 32
 #endif
 
 // 如果 ncdump -h 中有 scale_factor/add_offset 且参考结果需要物理值，保持 true。

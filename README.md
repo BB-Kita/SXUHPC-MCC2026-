@@ -1,4 +1,4 @@
-# SST 气候态 & P90 计算 —— CPU 极致优化版 (fast)
+# SST 气候态 & P90 计算 —— CPU 优化版 (fast)
 
 参考源文件：`/public/home/fujiake/feng` 下的 `get_climatology.m`、`clim_verification.m`、
 `get_climatology.sh`、`clim_verification.sh`。

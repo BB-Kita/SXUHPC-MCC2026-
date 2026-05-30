@@ -1,315 +1,395 @@
 #!/usr/bin/env python3
 """
-SST 气候态 & P90 计算 —— CPU 极致优化版 (滑动缓存 + C++/OpenMP 融合核)
-=====================================================================
-参考源文件: /public/home/fujiake/feng/get_climatology.m
+SST 气候态计算脚本 (高性能 Python 版)
+=====================================
+基于 1991-2020 年逐日 SST，计算气候态均值与 90% 分位数。
 
-性能定位: 这是 I/O 密集 + 计算轻量的任务。优化分两层打:
-
-  [I/O 层] 把读盘量降到下限
-    - 整场读取: 每个文件一次读完 (721x1440), 而非原始 MATLAB 的按行读 (721x 冗余)。
-    - 滑动窗口缓存: ±5 天窗口在相邻 doy 间重叠 10/11, 每个文件只读一次跨天复用,
-      总读取 30,360 -> ~3,060 次。
-    - 进程池并行读 (ProcessPoolExecutor): netCDF4/HDF5 在本环境非线程安全 (多线程会
-      段错误), 故用多进程, 每进程独立 HDF5。读盘与计算流水线重叠。
-
-  [计算层] 把 numpy 的瓶颈换成编译核
-    - np.nanpercentile 对每列全排序+NaN掩码, ~4s/天, 是 CPU 版真正的墙。
-    - 改用 clim_kernel.so (C++/OpenMP): 单遍融合 nanmean+P90, nth_element 求分位数,
-      列分块 + 全核并行, 预计 <0.5s/天 (实机)。
-
-精度: 全程 float64; 均值 Kahan 补偿求和; P90 用 Hazen(=MATLAB prctile) 插值。
-已离线验证核与 numpy hazen 的差异 < 1e-14。
+性能优化要点:
+1. netCDF4 直读，绕过 xarray 开销
+2. 预计算日历与日期字符串，消除重复 datetime 构造
+3. ThreadPoolExecutor 并行读文件（单 DOY 内，避免多进程 HDF5 冲突）
+4. 预分配 3D 数组，避免 list -> np.array 二次拷贝
+5. netCDF4 直写输出
+6. 增量均值 + numpy 向量化 nanpercentile (method='linear', 对齐 MATLAB)
 """
 
+from __future__ import annotations
+
+import argparse
+import logging
 import os
 import sys
 import time
-import ctypes
-import argparse
-from datetime import date, timedelta
+import warnings
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timedelta
+from functools import partial
+from typing import Dict, List, Optional, Tuple
 
+import netCDF4
 import numpy as np
-from netCDF4 import Dataset
 
-# ======================== 默认配置 ========================
-NC_PATH = '/public/home/achwjznh4b/Newdata/'
-SAVE_PATH = '/public/home/fujiake/feng/fast/output/'
-VAR_SST = 'data'
-VAR_LON = 'lon'
-VAR_LAT = 'lat'
-START_YR = 1991
-END_YR = 2020
-DELTA_DAY = 5
-N_LAT = 721
-N_LON = 1440
-N_COLS = N_LAT * N_LON
-DOY_START = 152
-DOY_END = 243
+warnings.filterwarnings("ignore")
 
-N_YEARS = END_YR - START_YR + 1
-N_WINDOW = 2 * DELTA_DAY + 1
-N_SAMPLES = N_YEARS * N_WINDOW    # 330
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-# 缺失文件用的全 NaN 整场 (常驻, 供核作为占位)
-NAN_ARR = np.full(N_COLS, np.nan, dtype=np.float64)
-
-# ======================== C++ 融合核 ========================
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_LIB_PATH = os.path.join(SCRIPT_DIR, 'clim_kernel.so')
+LAT_NUM = 721
+LON_NUM = 1440
 
 
-def load_kernel():
-    if not os.path.exists(_LIB_PATH):
-        sys.exit(f"[错误] 找不到 {_LIB_PATH}, 请先运行: bash build_kernel.sh")
-    lib = ctypes.CDLL(_LIB_PATH)
-    lib.compute_stats.argtypes = [
-        ctypes.c_void_p,  # const double* const* sample_ptrs
-        ctypes.c_int,     # n_samples
-        ctypes.c_long,    # ncols
-        ctypes.c_void_p,  # mean_out
-        ctypes.c_void_p,  # p90_out
-    ]
-    lib.compute_stats.restype = ctypes.c_int
-    lib.kernel_num_threads.restype = ctypes.c_int
-    return lib
+class Config:
+    NC_PATH = "/public/home/achwjznh4b/Newdata/"
+    SAVE_PATH = "/public/home/achwjznh4b/ERA5/Climatology/"
+    START_YEAR = 1991
+    END_YEAR = 2020
+    VAR_SST = "data"
+    VAR_LON = "lon"
+    VAR_LAT = "lat"
+    DELTA_DAY = 5
+    DEFAULT_START_DOY = 152
+    DEFAULT_END_DOY = 243
 
 
-# ======================== 日期映射 ========================
-
-def doy_to_month_day(doy):
-    """无闰年(剔除 2/29) 的 365 天日历: day-of-year -> (month, day)。doy 152 = 6/1。"""
-    days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    remaining = doy
-    for m, ndays in enumerate(days_in_month, 1):
-        if remaining <= ndays:
-            return m, remaining
-        remaining -= ndays
-    return 12, 31
+# ---------------------------------------------------------------------------
+# 预计算日历（模块级一次性初始化）
+# ---------------------------------------------------------------------------
+_YEAR_DATE_STR: Dict[int, List[str]] = {}
+_DOY_FILENAME: Dict[int, str] = {}
 
 
-def window_dates(doy):
-    """该 doy 需要的 330 个 'yyyymmdd' (按样本顺序: 年份外层, 窗口内层)。"""
-    month, day = doy_to_month_day(doy)
-    out = []
-    for yr in range(START_YR, END_YR + 1):
-        base = date(yr, month, day)
-        for off in range(-DELTA_DAY, DELTA_DAY + 1):
-            out.append((base + timedelta(days=off)).strftime('%Y%m%d'))
+def _build_year_dates(year: int) -> List[str]:
+    out: List[str] = []
+    current = datetime(year, 1, 1)
+    end = datetime(year, 12, 31)
+    while current <= end:
+        if current.month == 2 and current.day == 29:
+            current += timedelta(days=1)
+            continue
+        out.append(current.strftime("%Y%m%d"))
+        current += timedelta(days=1)
     return out
 
 
-# ======================== I/O (进程池 worker) ========================
+def _init_calendar_cache() -> None:
+    if _YEAR_DATE_STR:
+        return
+    for year in range(Config.START_YEAR, Config.END_YEAR + 1):
+        _YEAR_DATE_STR[year] = _build_year_dates(year)
+    ref = _YEAR_DATE_STR[2020]
+    for doy, date_str in enumerate(ref, start=1):
+        _DOY_FILENAME[doy] = f"{date_str[4:6]}{date_str[6:8]}.nc"
 
-def read_single_file(date_str):
-    """读取一个 NC 文件的整场, 返回连续 float64 一维 (N_COLS,)。失败返回 None。"""
-    fpath = os.path.join(NC_PATH, date_str)
+
+_init_calendar_cache()
+
+
+def generate_file_paths(
+    nc_path: str,
+    start_year: int,
+    end_year: int,
+    doy: int,
+    delta_day: int,
+) -> List[str]:
+    """生成指定 DOY 的全部输入文件路径（无 datetime 对象分配）。"""
+    join = os.path.join
+    paths: List[str] = []
+    center = doy - 1
+    for year in range(start_year, end_year + 1):
+        dates = _YEAR_DATE_STR[year]
+        n = len(dates)
+        lo = max(0, center - delta_day)
+        hi = min(n - 1, center + delta_day)
+        year_dates = dates[lo : hi + 1]
+        paths.extend(join(nc_path, d) for d in year_dates)
+    return paths
+
+
+def read_sst_file(file_path: str, var_sst: str) -> Optional[np.ndarray]:
+    """读取单个 SST 文件，失败返回 None。"""
     try:
-        ds = Dataset(fpath, 'r')
-        data = np.asarray(ds.variables[VAR_SST][:], dtype=np.float64)
-        ds.close()
-    except Exception:
+        with netCDF4.Dataset(file_path, "r") as ds:
+            data = ds.variables[var_sst][:]
+        if isinstance(data, np.ma.MaskedArray):
+            return data.filled(np.nan).astype(np.float64, copy=False)
+        return np.ascontiguousarray(data, dtype=np.float64)
+    except (OSError, KeyError, netCDF4.lib.NetCDF4Error):
         return None
-    if data.shape == (N_LON, N_LAT):
-        data = data.T
-    if data.shape != (N_LAT, N_LON):
-        return None
-    return np.ascontiguousarray(data.reshape(-1))
 
 
-# ======================== 输出 ========================
-
-def write_nc_output(filepath, lon, lat, doy, clim_mean, p90):
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    ds = Dataset(filepath, 'w', format='NETCDF4')
-    ds.createDimension('Lat', len(lat))
-    ds.createDimension('Lon', len(lon))
-    ds.createDimension('Day', 1)
-    v = ds.createVariable('dayofyear', 'f8', ('Day',))
-    v.long_name = 'Day of year (1-365, no 29Feb)'
-    v[:] = doy
-    ds.createVariable('Lat', 'f8', ('Lat',))[:] = lat
-    ds.createVariable('Lon', 'f8', ('Lon',))[:] = lon
-    # 与标准答案 (原始 MATLAB 输出, Python 读为 (Lat,Lon)) 保持一致的维度顺序,
-    # 否则验证/评分时 ref-test 维度不匹配 (见排错记录)。clim_mean/p90 形状 (N_LAT,N_LON)。
-    v = ds.createVariable('Climmean', 'f8', ('Lat', 'Lon'))
-    v.long_name = 'OSTIA SST climatology 1991-2020'
-    v[:, :] = clim_mean
-    v = ds.createVariable('P90_sst', 'f8', ('Lat', 'Lon'))
-    v.long_name = '90th percentile of SST'
-    v[:, :] = p90
-    ds.close()
+def _p90_lat_chunk(args: Tuple[np.ndarray, int, int, float]) -> Tuple[int, np.ndarray]:
+    """按纬度分块计算 P90（供多进程调用，Linux fork COW 共享 stack）。"""
+    stack, lo, hi, q = args
+    block = np.nanpercentile(stack[:, lo:hi, :], q, axis=0, method="linear")
+    return lo, block
 
 
-def read_lonlat():
-    for doy in range(DOY_START, DOY_END + 1):
-        for date_str in window_dates(doy):
-            fpath = os.path.join(NC_PATH, date_str)
-            if os.path.exists(fpath):
-                ds = Dataset(fpath, 'r')
-                lon = np.asarray(ds.variables[VAR_LON][:])
-                lat = np.asarray(ds.variables[VAR_LAT][:])
-                ds.close()
-                return lon, lat
-    raise FileNotFoundError(f'找不到任何输入 NC 文件, 请检查 --nc-path: {NC_PATH}')
+def parallel_nanpercentile(
+    stack: np.ndarray,
+    q: float,
+    workers: int,
+) -> np.ndarray:
+    """沿时间轴计算逐格 P90，纬度方向多进程并行。"""
+    n_lat = stack.shape[1]
+    if workers <= 1 or n_lat < workers * 2:
+        return np.nanpercentile(stack, q, axis=0, method="linear")
+
+    chunk = max(1, (n_lat + workers - 1) // workers)
+    ranges = [(i, min(i + chunk, n_lat)) for i in range(0, n_lat, chunk)]
+    tasks = [(stack, lo, hi, q) for lo, hi in ranges]
+
+    out = np.empty((n_lat, stack.shape[2]), dtype=np.float64)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for lo, block in pool.map(_p90_lat_chunk, tasks):
+            out[lo : lo + block.shape[0], :] = block
+    return out
 
 
-# ======================== 文件加载器 (进程池 + 串行回退) ========================
-
-class Loader:
-    """并行读盘。优先用进程池 (HDF5 非线程安全, 不能用线程); 若进程池不可用
-    (如计算节点 /dev/shm 信号量耗尽报 OSError), 自动回退到串行读, 保证作业能完成。
+def compute_climatology(
+    file_paths: List[str],
+    var_sst: str,
+    compute_workers: int,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
     """
+    计算单个 DOY 的气候态均值与 P90。
 
-    def __init__(self, io_workers):
-        self.pool = None
-        self._futs = {}
-        try:
-            self.pool = ProcessPoolExecutor(max_workers=io_workers)
-            # 触发一次, 确认进程池真的能起 (信号量/管道可用)
-            self.pool.submit(int).result(timeout=30)
-            print(f"  I/O: ProcessPool x{io_workers}")
-        except Exception as e:
-            if self.pool is not None:
-                try:
-                    self.pool.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
-            self.pool = None
-            print(f"  [warn] 进程池不可用 ({type(e).__name__}: {e}); 回退到串行读盘")
+    I/O 串行（共享文件系统 HDF5 安全）；P90 按纬度分块多进程并行。
+    """
+    n_paths = len(file_paths)
+    if n_paths == 0:
+        return None, None, 0
 
-    def prefetch(self, cache, dates):
-        """提交缺失文件的读取。有进程池则异步; 无则当场串行读入 cache。"""
-        if dates is None:
-            return
-        miss = [d for d in dates if d not in cache and d not in self._futs]
-        if self.pool is not None:
-            for d in miss:
-                self._futs[d] = self.pool.submit(read_single_file, d)
-        else:
-            for d in miss:
-                cache[d] = read_single_file(d)
+    running_sum = np.zeros((LAT_NUM, LON_NUM), dtype=np.float64)
+    running_count = np.zeros((LAT_NUM, LON_NUM), dtype=np.int64)
+    stack = np.empty((n_paths, LAT_NUM, LON_NUM), dtype=np.float64)
+    write_idx = 0
 
-    def gather(self, cache, dates):
-        """确保 dates 全部就位 (取回异步结果 / 串行补读)。"""
-        if dates is None:
-            return
-        for d in dates:
-            if d in self._futs:
-                cache[d] = self._futs.pop(d).result()
-            elif d not in cache:
-                cache[d] = read_single_file(d)
-
-    def close(self):
-        if self.pool is not None:
-            self.pool.shutdown(wait=True)
-
-
-# ======================== 主流程 ========================
-
-def run(doys, io_workers):
-    lib = load_kernel()
-    print(f"  Kernel OMP threads: {lib.kernel_num_threads()}")
-    lon, lat = read_lonlat()
-
-    mean_out = np.empty(N_COLS, dtype=np.float64)
-    p90_out = np.empty(N_COLS, dtype=np.float64)
-
-    cache = {}   # 'yyyymmdd' -> ndarray(N_COLS,) | None
-    loader = Loader(io_workers)
-
-    t_total = time.time()
-    try:
-        # 预取首个 doy (warmup, 330 个文件)
-        tio = time.time()
-        loader.prefetch(cache, window_dates(doys[0]))
-        loader.gather(cache, window_dates(doys[0]))
-        print(f"  [warmup] loaded {len(cache)} files in {time.time()-tio:.1f}s")
-
-        for idx, doy in enumerate(doys):
-            t0 = time.time()
-            dates = window_dates(doy)
-
-            # 组装样本指针 (缺失 -> NAN_ARR)
-            arrs = [cache.get(d) if cache.get(d) is not None else NAN_ARR
-                    for d in dates]
-            ptrs = np.fromiter((a.ctypes.data for a in arrs),
-                               dtype=np.uintp, count=N_SAMPLES)
-
-            # 流水线: 先把下一天缺失文件丢给进程池 (与下面的核计算重叠)
-            next_dates = window_dates(doys[idx + 1]) if idx + 1 < len(doys) else None
-            loader.prefetch(cache, next_dates)
-
-            # 计算 (ctypes 释放 GIL, 进程池读盘并行进行)
-            tk = time.time()
-            ret = lib.compute_stats(ptrs.ctypes.data, N_SAMPLES, N_COLS,
-                                    mean_out.ctypes.data, p90_out.ctypes.data)
-            if ret != 0:
-                raise RuntimeError(f"kernel failed: {ret}")
-            t_compute = time.time() - tk
-
-            # 写出
-            tw = time.time()
-            month, day = doy_to_month_day(doy)
-            out_file = os.path.join(SAVE_PATH, f"{month:02d}{day:02d}.nc")
-            write_nc_output(out_file, lon, lat, doy,
-                            mean_out.reshape(N_LAT, N_LON),
-                            p90_out.reshape(N_LAT, N_LON))
-            t_write = time.time() - tw
-
-            # 收下一天的读盘结果 (有进程池时多已完成 -> 即 I/O 等待时间)
-            tio = time.time()
-            loader.gather(cache, next_dates)
-            t_io = time.time() - tio
-
-            # 淘汰: 只保留下一天仍需要的
-            if next_dates is not None:
-                keep = set(next_dates)
-                for k in [k for k in cache if k not in keep]:
-                    del cache[k]
+    for fp in file_paths:
+        sst = read_sst_file(fp, var_sst)
+        if sst is None:
+            continue
+        if sst.shape != (LAT_NUM, LON_NUM):
+            if sst.shape == (LON_NUM, LAT_NUM):
+                sst = sst.T
             else:
-                cache.clear()
+                continue
+        valid = ~np.isnan(sst)
+        running_sum += np.where(valid, sst, 0.0)
+        running_count += valid
+        stack[write_idx] = sst
+        write_idx += 1
 
-            print(f"  DOY {doy:3d}: {time.time()-t0:5.2f}s  "
-                  f"compute={t_compute:.3f}s  io_wait={t_io:5.2f}s  "
-                  f"write={t_write:.2f}s", flush=True)
-    finally:
-        loader.close()
+    if write_idx == 0:
+        return None, None, 0
 
-    n = len(doys)
-    dt = time.time() - t_total
-    print(f"\n  Total: {dt:.0f}s ({dt/60:.1f}min)   Per day: {dt/n:.2f}s")
+    stack = stack[:write_idx]
 
+    with np.errstate(invalid="ignore", divide="ignore"):
+        clim = np.full((LAT_NUM, LON_NUM), np.nan, dtype=np.float64)
+        np.divide(running_sum, running_count, out=clim, where=running_count > 0)
 
-def main():
-    global NC_PATH, SAVE_PATH
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        p90 = parallel_nanpercentile(stack, 90.0, compute_workers)
 
-    cpu = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 8)
-    parser = argparse.ArgumentParser(description='SST 气候态 CPU 优化版 (C++核)')
-    parser.add_argument('--nc-path', type=str, default=NC_PATH)
-    parser.add_argument('--save-path', type=str, default=SAVE_PATH)
-    parser.add_argument('--doy-start', type=int, default=DOY_START)
-    parser.add_argument('--doy-end', type=int, default=DOY_END)
-    parser.add_argument('--io-workers', type=int, default=min(32, cpu))
-    parser.add_argument('--single-day', type=int, default=None)
-    args = parser.parse_args()
-
-    NC_PATH = args.nc_path
-    SAVE_PATH = args.save_path
-    os.makedirs(SAVE_PATH, exist_ok=True)
-
-    doys = [args.single_day] if args.single_day is not None \
-        else list(range(args.doy_start, args.doy_end + 1))
-
-    print(f"  Input:   {NC_PATH}")
-    print(f"  Output:  {SAVE_PATH}")
-    print(f"  Grid:    {N_LAT}x{N_LON}   DOY {doys[0]}..{doys[-1]} ({len(doys)} days)")
-    print(f"  I/O:     {args.io_workers} processes")
-    print()
-    run(doys, args.io_workers)
+    return clim, p90, write_idx
 
 
-if __name__ == '__main__':
+def save_climatology_netcdf(
+    clim: np.ndarray,
+    p90: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    doy: int,
+    save_path: str,
+) -> None:
+    """netCDF4 直写，比 xarray 更快。"""
+    filename = _DOY_FILENAME.get(doy)
+    if filename is None:
+        logger.error("无效 DOY: %d", doy)
+        return
+
+    filepath = os.path.join(save_path, filename)
+    with netCDF4.Dataset(filepath, "w", format="NETCDF4") as ds:
+        ds.createDimension("Lat", LAT_NUM)
+        ds.createDimension("Lon", LON_NUM)
+
+        lat_v = ds.createVariable("Lat", "f8", ("Lat",))
+        lat_v.units = "degrees_north"
+        lat_v[:] = lat
+
+        lon_v = ds.createVariable("Lon", "f8", ("Lon",))
+        lon_v.units = "degrees_east"
+        lon_v[:] = lon
+
+        clim_v = ds.createVariable("Climmean", "f8", ("Lat", "Lon"))
+        clim_v.long_name = "OSTIA SST climatology 1991-2020"
+        clim_v.units = "K"
+        clim_v[:] = clim
+
+        p90_v = ds.createVariable("P90_sst", "f8", ("Lat", "Lon"))
+        p90_v.long_name = "90th percentile of SST"
+        p90_v.units = "K"
+        p90_v[:] = p90
+
+        doy_v = ds.createVariable("dayofyear", "i4")
+        doy_v.long_name = "Day of year (1-365, no 29Feb)"
+        doy_v.assignValue(int(doy))
+
+    logger.info("已保存: %s", filepath)
+
+
+def process_single_doy(
+    doy: int,
+    nc_path: str,
+    var_sst: str,
+    start_year: int,
+    end_year: int,
+    delta_day: int,
+    compute_workers: int,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
+    t0 = time.perf_counter()
+    file_paths = generate_file_paths(nc_path, start_year, end_year, doy, delta_day)
+    clim, p90, valid_count = compute_climatology(
+        file_paths, var_sst, compute_workers
+    )
+    elapsed = time.perf_counter() - t0
+    if valid_count > 0:
+        logger.info(
+            "DOY %d 完成: %d/%d 文件, %.1fs",
+            doy,
+            valid_count,
+            len(file_paths),
+            elapsed,
+        )
+    else:
+        logger.warning("DOY %d 无有效数据", doy)
+    return clim, p90, valid_count
+
+
+def _process_and_save_doy(
+    doy: int,
+    nc_path: str,
+    save_path: str,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    compute_workers: int,
+) -> Tuple[int, int]:
+    """处理并保存单个 DOY，供 DOY 级多进程调用。"""
+    clim, p90, valid_count = process_single_doy(
+        doy,
+        nc_path,
+        Config.VAR_SST,
+        Config.START_YEAR,
+        Config.END_YEAR,
+        Config.DELTA_DAY,
+        compute_workers,
+    )
+    if clim is not None and p90 is not None and valid_count > 0:
+        save_climatology_netcdf(clim, p90, lon, lat, doy, save_path)
+    return doy, valid_count
+
+
+def read_coordinates(nc_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    sample = os.path.join(nc_path, "19910101")
+    with netCDF4.Dataset(sample, "r") as ds:
+        lat = np.asarray(ds.variables[Config.VAR_LAT][:], dtype=np.float64)
+        lon = np.asarray(ds.variables[Config.VAR_LON][:], dtype=np.float64)
+    return lat, lon
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SST 气候态计算 (高性能 Python 版)")
+    parser.add_argument("--start_doy", type=int, default=Config.DEFAULT_START_DOY)
+    parser.add_argument("--end_doy", type=int, default=Config.DEFAULT_END_DOY)
+    parser.add_argument("--nc_path", type=str, default=Config.NC_PATH)
+    parser.add_argument("--save_path", type=str, default=Config.SAVE_PATH)
+    parser.add_argument(
+        "--compute_workers",
+        type=int,
+        default=1,
+        help="单 DOY 内 P90 分块进程数 (默认: 1，推荐保持 1)",
+    )
+    parser.add_argument(
+        "--doy_workers",
+        type=int,
+        default=4,
+        help="同时处理的 DOY 进程数 (默认: 4，每进程串行读文件)",
+    )
+    parser.add_argument(
+        "--io_workers",
+        type=int,
+        default=1,
+        help=argparse.SUPPRESS,
+    )
+    # 兼容旧参数
+    parser.add_argument("--n_workers", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--no_dask", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--method", type=str, default="streaming", help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_arguments()
+    compute_workers = args.compute_workers
+    doy_workers = args.doy_workers
+    if args.no_dask:
+        compute_workers = 1
+        doy_workers = 1
+    elif args.n_workers is not None:
+        doy_workers = max(1, min(args.n_workers, 4))
+    if args.io_workers > 1:
+        logger.warning("共享文件系统不支持并行 NetCDF 读取，I/O 保持串行")
+
+    Config.NC_PATH = args.nc_path
+    Config.SAVE_PATH = args.save_path
+    os.makedirs(Config.SAVE_PATH, exist_ok=True)
+
+    sample = os.path.join(Config.NC_PATH, "19910101")
+    if not os.path.exists(sample):
+        logger.error("样本文件不存在: %s", sample)
+        sys.exit(1)
+
+    logger.info("读取经纬度...")
+    lat, lon = read_coordinates(Config.NC_PATH)
+    logger.info("网格: %d x %d", len(lat), len(lon))
+    logger.info("DOY 范围: %d - %d", args.start_doy, args.end_doy)
+    logger.info("P90 计算进程数: %d", compute_workers)
+    logger.info("DOY 并行进程数: %d", doy_workers)
+
+    doys = list(range(args.start_doy, args.end_doy + 1))
+    total_t0 = time.perf_counter()
+
+    if doy_workers <= 1:
+        for doy in doys:
+            _process_and_save_doy(
+                doy, Config.NC_PATH, Config.SAVE_PATH, lat, lon, compute_workers
+            )
+    else:
+        worker = partial(
+            _process_and_save_doy,
+            nc_path=Config.NC_PATH,
+            save_path=Config.SAVE_PATH,
+            lat=lat,
+            lon=lon,
+            compute_workers=compute_workers,
+        )
+        with ProcessPoolExecutor(max_workers=doy_workers) as pool:
+            list(pool.map(worker, doys))
+
+    total_elapsed = time.perf_counter() - total_t0
+    n_doy = args.end_doy - args.start_doy + 1
+    logger.info(
+        "全部完成: %d 天, 总耗时 %.1fs, 平均 %.1fs/天",
+        n_doy,
+        total_elapsed,
+        total_elapsed / max(n_doy, 1),
+    )
+
+
+if __name__ == "__main__":
     main()

@@ -1,63 +1,58 @@
 #!/usr/bin/env bash
 #SBATCH -J mcc
-#SBATCH -p kshdmcccc2026
+#SBATCH -p kshdmcc2026
 #SBATCH -N 1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
-#SBATCH --gres=gpu:4
-#SBATCH --time=04:00:00
-#SBATCH -o logs/mcc26_%j.out
-#SBATCH -e logs/mcc26_%j.err
-
-# ============================================================
-# MCC26_SXU 海洋热浪阈值计算 - Slurm 提交脚本
-# 使用 conda lsd 环境编译 + 运行（不提交，仅保存）
-# ============================================================
+#SBATCH -n 4
+#SBATCH --exclusive
+#SBATCH --gres=dcu:4
+#SBATCH --time=02:00:00
+#SBATCH -o /public/home/fujiake/fjk/MCC26_SXU/logs/mcc26_%j.out
+#SBATCH -e /public/home/fujiake/fjk/MCC26_SXU/logs/mcc26_%j.err
 
 set -euo pipefail
+
+WORK_DIR="/public/home/fujiake/fjk/MCC26_SXU"
+cd "${WORK_DIR}"
 
 echo "============================================"
 echo "  MCC26_SXU Slurm Job"
 echo "  Job ID: ${SLURM_JOB_ID}"
 echo "  Run at: $(date)"
 echo "  Node:   $(hostname)"
+echo "  CWD:    $(pwd)"
 echo "============================================"
 
-# --- 1. 激活 conda lsd 环境 ---
+# --- 1. 激活 conda 环境 ---
 source /public/home/fujiake/miniconda3/bin/activate
 conda activate lsd
 
 echo "[ENV] CONDA_PREFIX=${CONDA_PREFIX}"
-echo "[ENV] which g++  => $(which g++ 2>/dev/null || echo N/A)"
 echo "[ENV] which hipcc => $(which hipcc 2>/dev/null || echo N/A)"
 
-# --- 2. 编译（已手动编译，跳过）---
-# 使用 hipcc (海光 DCU 编译器) + conda lsd 的 NetCDF
-# SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-# BUILD_DIR="${SRC_DIR}/build"
-# OUT="${BUILD_DIR}/mcc_baseline"
+# --- 2. 编译 ---
+mkdir -p "${WORK_DIR}/logs" "${WORK_DIR}/build" "${WORK_DIR}/output"
+BUILD_DIR="${WORK_DIR}/build"
+OUT="${BUILD_DIR}/mcc_baseline"
 
-mkdir -p logs
-
-# CXX="hipcc"
-
-# echo ""
-# echo "[BUILD] Compiler: $(${CXX} --version 2>&1 | head -1)"
-# echo "[BUILD] NetCDF:   $(nc-config --version 2>/dev/null || echo unknown)"
-
-# ${CXX} -std=c++14 -O3 -fopenmp \
-#     "${SRC_DIR}/main.cpp" \
-#     "${SRC_DIR}/io_handler.cpp" \
-#     "${SRC_DIR}/compute_dcu.cpp" \
-#     -I"${SRC_DIR}" \
-#     -I"${CONDA_PREFIX}/include" \
-#     -L"${CONDA_PREFIX}/lib" \
-#     -lnetcdf \
-#     -Wl,-rpath,"${CONDA_PREFIX}/lib" \
-#     -o "${OUT}"
-
-# echo "[BUILD] Output: ${OUT}"
-# ls -lh "${OUT}"
+# Force rebuild if source is newer than binary
+if [ ! -f "${OUT}" ] || [ "${WORK_DIR}/io_handler.cpp" -nt "${OUT}" ] || [ "${WORK_DIR}/compute_dcu.cpp" -nt "${OUT}" ] || [ "${WORK_DIR}/main.cpp" -nt "${OUT}" ]; then
+    CXX="hipcc"
+    echo "[BUILD] Compiler: $(${CXX} --version 2>&1 | head -1)"
+    ${CXX} -std=c++14 -O3 -fopenmp \
+        "${WORK_DIR}/main.cpp" \
+        "${WORK_DIR}/io_handler.cpp" \
+        "${WORK_DIR}/compute_dcu.cpp" \
+        -I"${WORK_DIR}" \
+        -I"${CONDA_PREFIX}/include" \
+        -L"${CONDA_PREFIX}/lib" \
+        -lnetcdf \
+        -Wl,-rpath,"${CONDA_PREFIX}/lib" \
+        -o "${OUT}"
+    echo "[BUILD] Output: ${OUT}"
+    ls -lh "${OUT}"
+else
+    echo "[BUILD] Binary exists, skipping: ${OUT}"
+fi
 
 # --- 3. 运行 ---
 echo ""
@@ -66,7 +61,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-32}
 export OMP_PROC_BIND=close
 export OMP_PLACES=cores
 
-time "./build/mcc_baseline"
+time "${OUT}"
 
 echo ""
 echo "============================================"

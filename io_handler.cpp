@@ -164,15 +164,9 @@ static bool get_att_double(int ncid, int varid, const char* name, double& value)
     return status == NC_NOERR;
 }
 
-static void set_var_chunk_cache_if_possible(int ncid, int varid) {
-    // 对 NetCDF-4/HDF5 chunked/compressed 文件可能有帮助。
-    // 对非 chunked 文件通常没有明显副作用。
-    const size_t cache_size = 64ULL * 1024ULL * 1024ULL;  // 64 MB
-    const size_t cache_nelems = 1000003;
-    const float preemption = 0.75f;
-
-    // 如果失败，不中断程序。
-    nc_set_var_chunk_cache(ncid, varid, cache_size, cache_nelems, preemption);
+static void set_var_chunk_cache_if_possible(int /*ncid*/, int /*varid*/) {
+    // Disabled: nc_set_var_chunk_cache causes HDF5 threading issues
+    // with OpenMP parallel reads on this platform.
 }
 
 static SSTReadInfo inspect_sst_file(const std::string& filepath) {
@@ -318,11 +312,14 @@ static bool read_one_file_into_slot(const std::string& filepath,
 
     size_t slot_offset = static_cast<size_t>(slot) * SPATIAL_POINTS;
 
+    // Read as double first (data files are float64), then convert to float
+    std::vector<double> tmp_double(SPATIAL_POINTS);
+
     if (info.layout == DATA_LAT_LON) {
         size_t start[2] = {0, 0};
         size_t count[2] = {LAT_SIZE, LON_SIZE};
 
-        status = nc_get_vara_float(ncid, varid, start, count, &h_sst_data[slot_offset]);
+        status = nc_get_vara_double(ncid, varid, start, count, tmp_double.data());
         nc_close(ncid);
 
         if (status != NC_NOERR) {
@@ -330,17 +327,32 @@ static bool read_one_file_into_slot(const std::string& filepath,
             return false;
         }
 
-        normalize_buffer(&h_sst_data[slot_offset], SPATIAL_POINTS, info);
+        // Convert double → float, apply scale/offset, handle missing values
+        #pragma omp parallel for schedule(static)
+        for (long long i = 0; i < static_cast<long long>(SPATIAL_POINTS); ++i) {
+            double v = tmp_double[i];
+            bool is_missing = false;
+            if (info.has_fill && v == info.fill_value) is_missing = true;
+            if (info.has_missing && v == info.missing_value) is_missing = true;
+            if (is_missing) {
+                h_sst_data[slot_offset + i] = std::numeric_limits<float>::quiet_NaN();
+            } else {
+#if APPLY_SCALE_OFFSET
+                if (info.has_scale || info.has_offset) {
+                    v = v * info.scale_factor + info.add_offset;
+                }
+#endif
+                h_sst_data[slot_offset + i] = static_cast<float>(v);
+            }
+        }
         return true;
     }
 
-    // data(lon, lat) 时需要读入临时缓冲并转置成 [lat][lon]
-    std::vector<float> tmp(SPATIAL_POINTS);
-
+    // data(lon, lat) layout: read then transpose to [lat][lon]
     size_t start[2] = {0, 0};
     size_t count[2] = {LON_SIZE, LAT_SIZE};
 
-    status = nc_get_vara_float(ncid, varid, start, count, tmp.data());
+    status = nc_get_vara_double(ncid, varid, start, count, tmp_double.data());
     nc_close(ncid);
 
     if (status != NC_NOERR) {
@@ -348,14 +360,24 @@ static bool read_one_file_into_slot(const std::string& filepath,
         return false;
     }
 
-    normalize_buffer(tmp.data(), SPATIAL_POINTS, info);
-
     #pragma omp parallel for schedule(static)
     for (long long x_ll = 0; x_ll < static_cast<long long>(LON_SIZE); ++x_ll) {
         size_t x = static_cast<size_t>(x_ll);
         for (size_t y = 0; y < LAT_SIZE; ++y) {
-            h_sst_data[slot_offset + y * LON_SIZE + x] =
-                tmp[x * LAT_SIZE + y];
+            double v = tmp_double[x * LAT_SIZE + y];
+            bool is_missing = false;
+            if (info.has_fill && v == info.fill_value) is_missing = true;
+            if (info.has_missing && v == info.missing_value) is_missing = true;
+            if (is_missing) {
+                h_sst_data[slot_offset + y * LON_SIZE + x] = std::numeric_limits<float>::quiet_NaN();
+            } else {
+#if APPLY_SCALE_OFFSET
+                if (info.has_scale || info.has_offset) {
+                    v = v * info.scale_factor + info.add_offset;
+                }
+#endif
+                h_sst_data[slot_offset + y * LON_SIZE + x] = static_cast<float>(v);
+            }
         }
     }
 
@@ -409,6 +431,92 @@ void read_netcdf_parallel_for_doy(float* h_sst_data, int target_doy) {
 
     std::cout << "[I/O 模块] 数据读取完成。failed=" << failed_count
               << "/" << dates.size() << '\n';
+}
+
+// ============================================================
+// 滑动窗口 IO：相邻两天共享 328/330 样本，每天只读 30 个新文件
+// ============================================================
+
+static SSTReadInfo g_cached_info;
+static bool g_info_cached = false;
+
+static std::string date_for_year_doy_offset(int year, int doy, int offset) {
+    Date center = no_feb29_doy_to_date(year, doy);
+    Date target = add_days(center, offset);
+    return yyyymmdd(target);
+}
+
+void initialize_window(float* h_sst_data, int first_doy) {
+    std::string input_dir = with_trailing_slash(NC_INPUT_DIR);
+
+    // 缓存文件元信息（只需检查一次）
+    if (!g_info_cached) {
+        std::string inspect_file = input_dir + "19910101";
+        g_cached_info = inspect_sst_file(inspect_file);
+        g_info_cached = true;
+    }
+
+    int io_threads = IO_THREADS;
+#ifdef _OPENMP
+    int max_threads = omp_get_max_threads();
+    if (io_threads <= 0) io_threads = 1;
+    io_threads = std::min(io_threads, max_threads);
+#endif
+
+    const int window = 2 * CLIM_DELTA_DAY + 1;
+    std::cout << "[I/O 模块] 初始化滑动窗口: doy=" << first_doy
+              << "，读取 " << DAYS_TOTAL << " 个文件" << std::endl;
+
+    int failed_count = 0;
+
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(io_threads) reduction(+:failed_count)
+    for (int yr_idx = 0; yr_idx < CLIM_YEARS; ++yr_idx) {
+        int year = CLIM_START_YEAR + yr_idx;
+        for (int off = -CLIM_DELTA_DAY; off <= CLIM_DELTA_DAY; ++off) {
+            int slot = yr_idx * window + (off + CLIM_DELTA_DAY);
+            std::string date_str = date_for_year_doy_offset(year, first_doy, off);
+            std::string filepath = input_dir + date_str;
+            bool ok = read_one_file_into_slot(filepath, slot, g_cached_info, h_sst_data);
+            if (!ok) ++failed_count;
+        }
+    }
+
+    std::cout << "[I/O 模块] 窗口初始化完成。failed=" << failed_count
+              << "/" << DAYS_TOTAL << std::endl;
+}
+
+void slide_window_to_next_doy(float* h_sst_data, int current_doy, int first_doy) {
+    std::string input_dir = with_trailing_slash(NC_INPUT_DIR);
+    const int window = 2 * CLIM_DELTA_DAY + 1;
+    const int next_doy = current_doy + 1;
+
+    // 循环槽位替换：因为 mean/P90 与样本顺序无关
+    int replace_offset_idx = (current_doy - first_doy) % window;
+
+    int io_threads = IO_THREADS;
+#ifdef _OPENMP
+    int max_threads = omp_get_max_threads();
+    if (io_threads <= 0) io_threads = 1;
+    io_threads = std::min(io_threads, max_threads);
+#endif
+
+    int failed_count = 0;
+
+    // 每年读 1 个新文件（进入样本：next_doy + delta_day），覆盖最旧槽位
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(io_threads) reduction(+:failed_count)
+    for (int yr_idx = 0; yr_idx < CLIM_YEARS; ++yr_idx) {
+        int year = CLIM_START_YEAR + yr_idx;
+        int slot = yr_idx * window + replace_offset_idx;
+        std::string date_str = date_for_year_doy_offset(year, next_doy, CLIM_DELTA_DAY);
+        std::string filepath = input_dir + date_str;
+        bool ok = read_one_file_into_slot(filepath, slot, g_cached_info, h_sst_data);
+        if (!ok) ++failed_count;
+    }
+
+    if (failed_count > 0) {
+        std::cout << "[I/O 模块] 滑动 doy=" << next_doy
+                  << "，failed=" << failed_count << "/" << CLIM_YEARS << std::endl;
+    }
 }
 
 // 保留原来的接口：默认读取 TARGET_DOY 对应的 30年×11天窗口

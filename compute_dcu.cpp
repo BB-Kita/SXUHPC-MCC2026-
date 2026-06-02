@@ -191,16 +191,14 @@ __global__ void compute_mean_p90_kernel(
 
 void dispatch_to_4_dcus(float* h_sst_data) {
     using Clock = std::chrono::steady_clock;
-    const int NUM_GPUS = 4;
     const int days_total = static_cast<int>(DAYS_TOTAL);
     const int spatial_total = static_cast<int>(SPATIAL_POINTS);
 
-    // 查询每张卡的显存，决定切分策略
     int gpu_count = 0;
     hipGetDeviceCount(&gpu_count);
-    if (gpu_count < NUM_GPUS) {
-        std::cerr << "[DCU 模块] 需要 " << NUM_GPUS << " 张 DCU，仅发现 "
-                  << gpu_count << " 张" << std::endl;
+    const int NUM_GPUS = gpu_count;
+    if (NUM_GPUS <= 0) {
+        std::cerr << "[DCU 模块] 未发现可用 DCU" << std::endl;
         std::exit(1);
     }
 
@@ -347,4 +345,128 @@ void dispatch_to_4_dcus(float* h_sst_data) {
     // 释放输出缓冲区
     HIP_CHECK(hipHostFree(h_mean));
     HIP_CHECK(hipHostFree(h_p90));
+}
+
+// ============================================================
+// 版本：逐次分配+释放（与 dispatch_to_4_dcus 同策略，确保正确性）
+// ============================================================
+
+void dispatch_to_4_dcus_with_output(float* h_sst_data, float* h_mean, float* h_p90,
+                                     const int* /*changed_slots*/, int /*num_changed*/) {
+    using Clock = std::chrono::steady_clock;
+    const int days_total = static_cast<int>(DAYS_TOTAL);
+    const int spatial_total = static_cast<int>(SPATIAL_POINTS);
+
+    int gpu_count = 0;
+    hipGetDeviceCount(&gpu_count);
+    const int NUM_GPUS = gpu_count;
+    if (NUM_GPUS <= 0) {
+        std::cerr << "[DCU 模块] 未发现可用 DCU" << std::endl;
+        std::exit(1);
+    }
+
+    int rows_per_gpu = (LAT_SIZE + NUM_GPUS - 1) / NUM_GPUS;
+
+    auto t0 = Clock::now();
+
+    hipStream_t streams[8];
+    float* d_data[8];
+    float* d_mean[8];
+    float* d_p90[8];
+    int lat_start[8], lat_end[8], local_rows_arr[8];
+
+    size_t full_data_bytes = (size_t)days_total * spatial_total * sizeof(float);
+
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamCreate(&streams[i]));
+
+        lat_start[i] = i * rows_per_gpu;
+        lat_end[i] = std::min((i + 1) * rows_per_gpu, (int)LAT_SIZE);
+        local_rows_arr[i] = lat_end[i] - lat_start[i];
+
+        if (local_rows_arr[i] <= 0) continue;
+
+        int local_spatial = local_rows_arr[i] * LON_SIZE;
+
+        HIP_CHECK(hipMalloc(&d_data[i], full_data_bytes));
+        HIP_CHECK(hipMalloc(&d_mean[i], local_spatial * sizeof(float)));
+        HIP_CHECK(hipMalloc(&d_p90[i],  local_spatial * sizeof(float)));
+
+        HIP_CHECK(hipMemcpyAsync(d_data[i], h_sst_data, full_data_bytes,
+                                 hipMemcpyHostToDevice, streams[i]));
+    }
+
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamSynchronize(streams[i]));
+    }
+
+    auto t1 = Clock::now();
+    double transfer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // ---- Kernel 计算 ----
+    t0 = Clock::now();
+
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        if (local_rows_arr[i] <= 0) continue;
+
+        HIP_CHECK(hipSetDevice(i));
+        int local_spatial = local_rows_arr[i] * LON_SIZE;
+        int spatial_start = lat_start[i] * LON_SIZE;
+
+        int block_size = 256;
+        int grid_size = (local_spatial + block_size - 1) / block_size;
+
+        compute_mean_p90_kernel<<<dim3(grid_size), dim3(block_size), 0, streams[i]>>>(
+            d_data[i], d_mean[i], d_p90[i],
+            spatial_total, days_total,
+            spatial_start, spatial_start + local_spatial);
+    }
+
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamSynchronize(streams[i]));
+    }
+
+    t1 = Clock::now();
+    double kernel_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // ---- 结果回传 ----
+    t0 = Clock::now();
+
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        if (local_rows_arr[i] <= 0) continue;
+
+        HIP_CHECK(hipSetDevice(i));
+        int local_spatial = local_rows_arr[i] * LON_SIZE;
+        int host_offset = lat_start[i] * LON_SIZE;
+
+        HIP_CHECK(hipMemcpy(h_mean + host_offset, d_mean[i],
+                            local_spatial * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_p90 + host_offset, d_p90[i],
+                            local_spatial * sizeof(float),
+                            hipMemcpyDeviceToHost));
+    }
+
+    t1 = Clock::now();
+    double gather_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // ---- 释放设备资源 ----
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamDestroy(streams[i]));
+        HIP_CHECK(hipFree(d_data[i]));
+        HIP_CHECK(hipFree(d_mean[i]));
+        HIP_CHECK(hipFree(d_p90[i]));
+    }
+
+    double total_ms = transfer_ms + kernel_ms + gather_ms;
+    std::cout << "[DCU 模块] 传输=" << transfer_ms << "ms kernel=" << kernel_ms
+              << "ms 回传=" << gather_ms << "ms 总计=" << total_ms << "ms" << std::endl;
+}
+
+void cleanup_dcu_buffers() {
+    // 无持久缓冲区，无需清理
 }

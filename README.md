@@ -21,17 +21,98 @@ MCC26 超算竞赛初赛参赛作品。基于 1991-2020 年海表温度融合资
 - 最多 2 台服务器，单机 32 核 + 4 x K100 DCU
 - 运行时间限制 2 小时
 
+## 验证结果
+
+| 指标 | 赛题要求 | 实际结果 |
+|------|---------|---------|
+| 季度整体 P90 RMSE | < 2.0 C | **0.0127 C** |
+| 季度整体 Clim RMSE | < 2.0 C | **0.0000 C** |
+| 逐日 P90 RMSE (max) | < 1.0 C | **0.0137 C** |
+| 逐日 Clim RMSE (max) | < 1.0 C | **0.000004 C** |
+
+## 性能数据
+
+硬件：2 台服务器, 每台 4x K100_AI DCU (gfx906), 32 核 CPU
+
+### 92 天全量运行
+
+| 配置 | 总时间 (real) | 说明 |
+|------|--------------|------|
+| 单节点 DTK24 raw pread t32 | **24.7s** | 最优单节点配置 |
+| 双节点 t32 (各 46 天) | **24.3s** | 受限于首天全量上传 |
+
+### DCU 计算 kernel
+
+| 操作 | 耗时 | 说明 |
+|------|------|------|
+| P90/Clim kernel | ~15ms | 4 DCU 并行, rows_per_gpu=181 |
+| 全量 upload (330 slots) | ~550ms | 首天 |
+| 增量 upload (30 slots) | ~60ms | 后续每天 |
+| download 结果 | ~0.35ms | |
+
+### IO 线程数扫描 (2 天 smoke test)
+
+| 线程数 | program_total | 首天 day_total |
+|--------|--------------|---------------|
+| t1 | 22.1s | 5.82s |
+| t8 | 6.98s | 4.83s |
+| t32 | 5.17s | 3.49s |
+
+### 对比其他方案
+
+| 版本 | 用时 | 说明 |
+|------|------|------|
+| MATLAB baseline | >16h | 单核，赛题提供 |
+| Python (多进程) | ~3min20s | 双机 64 核 |
+| Python (预加载) | ~50s | 全量数据预加载到内存 |
+| **C++/HIP DCU (本项目)** | **~24s** | 4 DCU 并行, raw pread, t32 IO |
+
 ## 项目结构
 
 ```
 MCC26_SXU/
-├── main.cpp              # 主程序入口：分配锁页内存 -> IO -> DCU 计算
-├── io_handler.cpp/.h     # NetCDF 并行读取模块 (OpenMP 多线程)
-├── compute_dcu.cpp/.h    # HIP DCU 计算内核 (4 卡异步调度)
-├── algo_p90.h            # P90 算法设备端接口 (快速选择，备用)
-├── config.h              # 常量定义：维度、路径、HIP 错误检查宏
-├── CMakelists.txt        # CMake 构建脚本 (hipcc 编译)
-├── run_mcc26.slurm       # Slurm 提交脚本
+├── main.cpp                  # 主程序入口
+├── io_handler.cpp/.h         # IO 模块 (NetCDF / raw pread, 滑动窗口)
+├── compute_dcu.cpp/.h        # HIP DCU 计算内核 (P90 + Clim)
+├── algo_p90.h                # P90 分位数算法
+├── config.h                  # 常量定义：维度、路径、IO 线程数等
+├── probe_hdf5_offset.cpp     # HDF5 数据偏移探测工具
+├── CMakelists.txt            # CMake 构建脚本 (hipcc)
+│
+├── run_mcc26.slurm           # 基础 Slurm 提交脚本
+├── run_mcc26_dtk24.slurm     # DTK24 编译运行
+├── run_mcc26_two_node_t32.slurm  # 双节点 t32 运行
+├── run_io_threads_sweep.slurm    # IO 线程数扫描实验
+├── run_ioopt_2days.slurm     # IO 优化 2 天 smoke test
+├── run_inc_2days.slurm       # 增量 IO 2 天测试
+├── run_debug_1day.slurm      # 调试用 1 天运行
+├── run_probe_*.slurm         # 各种探测脚本 (arch/dtk/flags/simple)
+├── run_validate_official_logic.slurm  # 官方逻辑验证
+│
+├── get_climatology.m/sh      # 赛题基准脚本
+├── clim_verification.m/sh    # 赛题验证脚本
+├── validate_official_logic.m # 官方逻辑 MATLAB 验证
+├── verify.py                 # Python RMSE 验证
+│
+├── logs/                     # 运行日志
+│   ├── probe_arch/           # 架构探测
+│   ├── probe_debug/          # 调试日志
+│   ├── probe_dtk/            # DTK 版本探测
+│   ├── probe_flags/          # 编译选项探测
+│   ├── probe_simple/         # 简单 kernel 探测
+│   ├── run_2day/             # 2 天 smoke test
+│   ├── run_2node/            # 双节点运行
+│   ├── run_full/             # 全量 92 天运行
+│   ├── run_iosweep/          # IO 线程数扫描
+│   └── run_verify/           # 验证运行
+│
+├── verification_latest/      # 最新 RMSE 验证结果
+│   ├── RMSE_P90.txt          # 季度 P90 RMSE
+│   ├── RMSE_clim.txt         # 季度 Clim RMSE
+│   ├── RMSE_P90_daily.txt    # 逐日 P90 RMSE
+│   └── RMSE_clim_daily.txt   # 逐日 Clim RMSE
+│
+├── BENCHMARK_RESULTS.md      # 详细性能数据
 └── .gitignore
 ```
 
@@ -53,59 +134,74 @@ MCC26_SXU/
 ### 多卡并行
 
 - 4 张 DCU 按 lat 行切分 (721 行 / 4 卡)
-- 每张卡拷贝全量数据到显存，仅计算分配到的空间切片
+- persistent DCU buffers，避免重复分配设备内存
 - 使用 HIP Stream 异步调度，kernel 并行执行
 - 结果通过 `hipMemcpyAsync` 回传，pin memory 对接 PCIe
 
-### IO 模块 (io_handler.cpp)
+### IO 优化
 
-- OpenMP 多线程并行读取 NetCDF 文件
+- **增量滑动窗口**：避免每天重读 330 个文件，仅滑动更新 30 个
+- **raw HDF5 pread**：绕过 NetCDF 库开销，直接 pread 原始 HDF5 数据
+- **多线程 IO (t32)**：并行读取窗口文件，首天初始化加速 40%
 - 自动检测数据维度布局 (lat-lon / lon-lat)，必要时转置
 - 处理 `_FillValue`、`missing_value`、`scale_factor`、`add_offset`
 - 365 天日历 (剔除 2 月 29 日)
+
+### 双节点分片
+
+- 92 天对半分 (DOY 152-197 / 198-243)
+- 各节点独立计算，无需节点间通信
+- `srun` 分配到不同节点，各跑 46 天
 
 ## 构建与运行
 
 ### 依赖
 
-- 海光 DTK (hipcc 编译器)
+- 海光 DTK 24.04 (hipcc 编译器)
 - NetCDF-C 库
 - OpenMP
-- conda `lsd` 环境 (已在平台上配置)
+- conda `lsd` 环境
 
 ### 编译
 
 ```bash
-# 激活环境
 source /public/home/fujiake/miniconda3/bin/activate
 conda activate lsd
 
-# CMake 构建
 mkdir -p build && cd build
 cmake ..
 make -j
 
 # 或手动编译
-hipcc -std=c++14 -O3 -fopenmp \
+hipcc -std=c++17 -O3 -fopenmp \
     main.cpp io_handler.cpp compute_dcu.cpp \
     -I. -I${CONDA_PREFIX}/include \
     -L${CONDA_PREFIX}/lib -lnetcdf \
     -Wl,-rpath,${CONDA_PREFIX}/lib \
-    -o build/mcc_baseline
+    -o build/mcc_baseline_inc
 ```
 
 ### 提交作业
 
 ```bash
-sbatch run_mcc26.slurm
+# 单节点全量运行
+sbatch run_mcc26_dtk24.slurm
+
+# 双节点运行
+sbatch run_mcc26_two_node_t32.slurm
+
+# IO 线程数扫描
+sbatch run_io_threads_sweep.slurm
 ```
 
-### 查看运行状态
+### 验证结果
 
 ```bash
-squeue                    # 查看作业队列
-cat logs/mcc26_*.out      # 查看标准输出
-hy-smi                    # 查看 DCU 使用情况
+# Python 验证
+python verify.py
+
+# MATLAB 官方验证
+matlab -nodisplay -nosplash -nodesktop < validate_official_logic.m
 ```
 
 ## 配置参数
@@ -120,23 +216,7 @@ hy-smi                    # 查看 DCU 使用情况
 | `CLIM_END_YEAR` | 2020 | 气候基准期结束年 |
 | `CLIM_DELTA_DAY` | 5 | 前后延伸天数 |
 | `NC_INPUT_DIR` | `/public/home/achwjznh4b/Newdata/` | 输入数据目录 |
-| `IO_THREADS` | 4 | IO 并行线程数 |
-
-## 性能参考
-
-| 版本 | 用时 | 说明 |
-|------|------|------|
-| MATLAB baseline | >16h | 单核，赛题提供 |
-| Python (多进程) | ~3min20s | 双机 64 核 |
-| Python (预加载) | ~50s | 全量数据预加载到内存 |
-| C++/HIP (本项目) | TBD | 4 DCU 并行 |
-
-## 待完成
-
-- [ ] 在比赛平台上编译并运行
-- [ ] 使用验证脚本 (`clim_verification.m`) 检查精度
-- [ ] 性能调优 (profiling、内存带宽优化)
-- [ ] 输出结果到指定目录 (`ERA5/Climatology/`)
+| `IO_THREADS` | 32 | IO 并行线程数 |
 
 ## 比赛关键时间
 

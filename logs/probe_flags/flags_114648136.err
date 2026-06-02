@@ -1,0 +1,7 @@
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2551 Bus error               "${bin}"
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2612 Bus error               "${bin}"
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2662 Bus error               "${bin}"
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2726 Bus error               "${bin}"
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2780 Bus error               "${bin}"
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2870 Bus error               "${bin}"
+/opt/gridview/slurm/spool_slurmd/job114648136/slurm_script: line 56:  2978 Bus error               "${bin}"

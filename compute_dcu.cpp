@@ -5,8 +5,10 @@
 #include <vector>
 #include <cmath>
 #include <cfloat>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 // ============================================================
 // Hybrid P90 Kernel: coarse histogram → adaptive collect → exact interp
@@ -350,6 +352,223 @@ void dispatch_to_4_dcus(float* h_sst_data) {
 // ============================================================
 // 版本：逐次分配+释放（与 dispatch_to_4_dcus 同策略，确保正确性）
 // ============================================================
+
+static constexpr int MAX_PERSISTENT_GPUS = 8;
+static bool g_persistent_initialized = false;
+static int g_persistent_gpu_count = 0;
+static int g_persistent_rows_per_gpu = 0;
+static int g_persistent_lat_start[MAX_PERSISTENT_GPUS] = {0};
+static int g_persistent_lat_end[MAX_PERSISTENT_GPUS] = {0};
+static int g_persistent_local_rows[MAX_PERSISTENT_GPUS] = {0};
+static hipStream_t g_persistent_streams[MAX_PERSISTENT_GPUS] = {nullptr};
+static float* g_persistent_data[MAX_PERSISTENT_GPUS] = {nullptr};
+static float* g_persistent_mean[MAX_PERSISTENT_GPUS] = {nullptr};
+static float* g_persistent_p90[MAX_PERSISTENT_GPUS] = {nullptr};
+
+static bool debug_enabled() {
+    const char* env = std::getenv("MCC_DEBUG_VALIDATE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static void print_field_stats(const char* name, const float* data, int n) {
+    long long nan_count = 0;
+    long long zero_count = 0;
+    long long finite_count = 0;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+
+    for (int i = 0; i < n; ++i) {
+        float v = data[i];
+        if (std::isnan(v)) {
+            ++nan_count;
+            continue;
+        }
+        ++finite_count;
+        if (v == 0.0f) ++zero_count;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+
+    std::cout << "[debug] " << name
+              << " finite=" << finite_count
+              << " nan=" << nan_count
+              << " zero=" << zero_count;
+    if (finite_count > 0) {
+        std::cout << " min=" << min_v << " max=" << max_v;
+    }
+    std::cout << std::endl;
+}
+
+static void init_persistent_dcu_buffers(int spatial_total, int days_total) {
+    int gpu_count = 0;
+    hipGetDeviceCount(&gpu_count);
+    if (gpu_count <= 0) {
+        std::cerr << "[DCU module] no available DCU" << std::endl;
+        std::exit(1);
+    }
+    if (gpu_count > MAX_PERSISTENT_GPUS) {
+        std::cerr << "[DCU module] gpu_count=" << gpu_count
+                  << " exceeds MAX_PERSISTENT_GPUS=" << MAX_PERSISTENT_GPUS << std::endl;
+        std::exit(1);
+    }
+
+    g_persistent_gpu_count = gpu_count;
+    g_persistent_rows_per_gpu = ((int)LAT_SIZE + g_persistent_gpu_count - 1) /
+                                g_persistent_gpu_count;
+
+    size_t full_data_bytes = (size_t)days_total * spatial_total * sizeof(float);
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamCreate(&g_persistent_streams[i]));
+
+        g_persistent_lat_start[i] = i * g_persistent_rows_per_gpu;
+        g_persistent_lat_end[i] = std::min((i + 1) * g_persistent_rows_per_gpu, (int)LAT_SIZE);
+        g_persistent_local_rows[i] = g_persistent_lat_end[i] - g_persistent_lat_start[i];
+        if (g_persistent_local_rows[i] <= 0) continue;
+
+        int local_spatial = g_persistent_local_rows[i] * LON_SIZE;
+        HIP_CHECK(hipMalloc(&g_persistent_data[i], full_data_bytes));
+        HIP_CHECK(hipMalloc(&g_persistent_mean[i], local_spatial * sizeof(float)));
+        HIP_CHECK(hipMalloc(&g_persistent_p90[i],  local_spatial * sizeof(float)));
+    }
+
+    std::cout << "[DCU module] persistent buffers initialized on "
+              << g_persistent_gpu_count << " DCU(s); rows_per_gpu="
+              << g_persistent_rows_per_gpu << std::endl;
+    g_persistent_initialized = true;
+}
+
+void dispatch_to_4_dcus_with_output_incremental(float* h_sst_data, float* h_mean, float* h_p90,
+                                                const int* changed_slots, int num_changed) {
+    using Clock = std::chrono::steady_clock;
+    const int days_total = static_cast<int>(DAYS_TOTAL);
+    const int spatial_total = static_cast<int>(SPATIAL_POINTS);
+
+    if (!g_persistent_initialized) {
+        init_persistent_dcu_buffers(spatial_total, days_total);
+    }
+
+    auto t0 = Clock::now();
+    size_t full_data_bytes = (size_t)days_total * spatial_total * sizeof(float);
+    bool full_upload = (changed_slots == nullptr || num_changed <= 0);
+
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        if (g_persistent_local_rows[i] <= 0) continue;
+        HIP_CHECK(hipSetDevice(i));
+
+        if (full_upload) {
+            HIP_CHECK(hipMemcpyAsync(g_persistent_data[i], h_sst_data, full_data_bytes,
+                                     hipMemcpyHostToDevice, g_persistent_streams[i]));
+        } else {
+            for (int j = 0; j < num_changed; ++j) {
+                int slot = changed_slots[j];
+                size_t offset = (size_t)slot * spatial_total;
+                HIP_CHECK(hipMemcpyAsync(g_persistent_data[i] + offset,
+                                         h_sst_data + offset,
+                                         spatial_total * sizeof(float),
+                                         hipMemcpyHostToDevice,
+                                         g_persistent_streams[i]));
+            }
+        }
+    }
+
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        if (g_persistent_local_rows[i] <= 0) continue;
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamSynchronize(g_persistent_streams[i]));
+    }
+
+    auto t1 = Clock::now();
+    double transfer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    t0 = Clock::now();
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        if (g_persistent_local_rows[i] <= 0) continue;
+
+        HIP_CHECK(hipSetDevice(i));
+        int local_spatial = g_persistent_local_rows[i] * LON_SIZE;
+        int spatial_start = g_persistent_lat_start[i] * LON_SIZE;
+        int block_size = 256;
+        int grid_size = (local_spatial + block_size - 1) / block_size;
+
+        compute_mean_p90_kernel<<<dim3(grid_size), dim3(block_size), 0, g_persistent_streams[i]>>>(
+            g_persistent_data[i], g_persistent_mean[i], g_persistent_p90[i],
+            spatial_total, days_total,
+            spatial_start, spatial_start + local_spatial);
+        HIP_CHECK(hipPeekAtLastError());
+    }
+
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        if (g_persistent_local_rows[i] <= 0) continue;
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamSynchronize(g_persistent_streams[i]));
+    }
+
+    t1 = Clock::now();
+    double kernel_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    t0 = Clock::now();
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        if (g_persistent_local_rows[i] <= 0) continue;
+
+        HIP_CHECK(hipSetDevice(i));
+        int local_spatial = g_persistent_local_rows[i] * LON_SIZE;
+        int host_offset = g_persistent_lat_start[i] * LON_SIZE;
+
+        HIP_CHECK(hipMemcpyAsync(h_mean + host_offset, g_persistent_mean[i],
+                                 local_spatial * sizeof(float),
+                                 hipMemcpyDeviceToHost,
+                                 g_persistent_streams[i]));
+        HIP_CHECK(hipMemcpyAsync(h_p90 + host_offset, g_persistent_p90[i],
+                                 local_spatial * sizeof(float),
+                                 hipMemcpyDeviceToHost,
+                                 g_persistent_streams[i]));
+    }
+
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        if (g_persistent_local_rows[i] <= 0) continue;
+        HIP_CHECK(hipSetDevice(i));
+        HIP_CHECK(hipStreamSynchronize(g_persistent_streams[i]));
+    }
+
+    t1 = Clock::now();
+    double gather_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double total_ms = transfer_ms + kernel_ms + gather_ms;
+
+    std::cout << "[DCU module] upload=" << transfer_ms
+              << "ms (" << (full_upload ? "full" : "incremental")
+              << ", slots=" << (full_upload ? days_total : num_changed)
+              << ") kernel=" << kernel_ms
+              << "ms download=" << gather_ms
+              << "ms total=" << total_ms << "ms" << std::endl;
+
+    if (debug_enabled()) {
+        print_field_stats("gpu_mean_after_d2h", h_mean, spatial_total);
+        print_field_stats("gpu_p90_after_d2h", h_p90, spatial_total);
+    }
+}
+
+void cleanup_dcu_persistent_buffers() {
+    if (!g_persistent_initialized) return;
+
+    for (int i = 0; i < g_persistent_gpu_count; ++i) {
+        HIP_CHECK(hipSetDevice(i));
+        if (g_persistent_data[i]) HIP_CHECK(hipFree(g_persistent_data[i]));
+        if (g_persistent_mean[i]) HIP_CHECK(hipFree(g_persistent_mean[i]));
+        if (g_persistent_p90[i]) HIP_CHECK(hipFree(g_persistent_p90[i]));
+        if (g_persistent_streams[i]) HIP_CHECK(hipStreamDestroy(g_persistent_streams[i]));
+
+        g_persistent_data[i] = nullptr;
+        g_persistent_mean[i] = nullptr;
+        g_persistent_p90[i] = nullptr;
+        g_persistent_streams[i] = nullptr;
+        g_persistent_local_rows[i] = 0;
+    }
+
+    g_persistent_gpu_count = 0;
+    g_persistent_rows_per_gpu = 0;
+    g_persistent_initialized = false;
+}
 
 void dispatch_to_4_dcus_with_output(float* h_sst_data, float* h_mean, float* h_p90,
                                      const int* /*changed_slots*/, int /*num_changed*/) {

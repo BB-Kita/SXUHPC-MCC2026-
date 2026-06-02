@@ -1,0 +1,44 @@
+compute_dcu.cpp:200:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+    hipGetDeviceCount(&gpu_count);
+    ^~~~~~~~~~~~~~~~~ ~~~~~~~~~~
+compute_dcu.cpp:404:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+    hipGetDeviceCount(&gpu_count);
+    ^~~~~~~~~~~~~~~~~ ~~~~~~~~~~
+compute_dcu.cpp:580:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+    hipGetDeviceCount(&gpu_count);
+    ^~~~~~~~~~~~~~~~~ ~~~~~~~~~~
+3 warnings generated when compiling for gfx906.
+compute_dcu.cpp:200:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+    hipGetDeviceCount(&gpu_count);
+    ^~~~~~~~~~~~~~~~~ ~~~~~~~~~~
+compute_dcu.cpp:404:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+    hipGetDeviceCount(&gpu_count);
+    ^~~~~~~~~~~~~~~~~ ~~~~~~~~~~
+compute_dcu.cpp:580:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+    hipGetDeviceCount(&gpu_count);
+    ^~~~~~~~~~~~~~~~~ ~~~~~~~~~~
+3 warnings generated when compiling for host.
+
+real	0m23.518s
+user	7m17.251s
+sys	0m43.620s
+
+real	0m11.800s
+user	0m12.059s
+sys	0m1.906s
+
+real	0m9.365s
+user	0m11.831s
+sys	0m2.286s
+
+real	0m7.418s
+user	0m11.885s
+sys	0m2.525s
+
+real	0m6.743s
+user	0m14.622s
+sys	0m3.695s
+
+real	0m5.408s
+user	0m15.653s
+sys	0m4.684s

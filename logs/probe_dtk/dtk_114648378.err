@@ -1,0 +1,18 @@
+launch invalid device function
+/tmp/mcc26_dtk_114648378.cpp:7:1: warning: void function is missing a return statement [-Wreturn-type]
+}
+^
+1 warning generated when compiling for gfx906.
+/tmp/mcc26_dtk_114648378.cpp:7:1: warning: void function is missing a return statement [-Wreturn-type]
+}
+^
+1 warning generated when compiling for host.
+/tmp/mcc26_dtk_114648378.cpp:7:1: warning: void function is missing a return statement [-Wreturn-type]
+}
+^
+1 warning generated when compiling for gfx906.
+/tmp/mcc26_dtk_114648378.cpp:7:1: warning: void function is missing a return statement [-Wreturn-type]
+}
+^
+1 warning generated when compiling for host.
+Could not open /var/log/hylog/.

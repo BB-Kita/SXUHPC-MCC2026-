@@ -2,13 +2,19 @@
 #include "config.h"
 
 #include <netcdf.h>
+#include <hdf5.h>
 #include <omp.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -74,7 +80,30 @@ struct SSTReadInfo {
 
     bool has_offset;
     double add_offset;
+
+    bool raw_data_read;
+    std::size_t raw_data_offset;
 };
+
+static int runtime_io_threads() {
+    int io_threads = IO_THREADS;
+    if (const char* env = std::getenv("MCC_IO_THREADS")) {
+        int requested = std::atoi(env);
+        if (requested > 0) {
+            io_threads = requested;
+        }
+    }
+#ifdef _OPENMP
+    int max_threads = omp_get_max_threads();
+    if (io_threads <= 0) {
+        io_threads = 1;
+    }
+    io_threads = std::min(io_threads, max_threads);
+#else
+    io_threads = 1;
+#endif
+    return io_threads;
+}
 
 static bool is_leap(int y) {
     return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
@@ -164,6 +193,49 @@ static bool get_att_double(int ncid, int varid, const char* name, double& value)
     return status == NC_NOERR;
 }
 
+static bool inspect_raw_hdf5_data(const std::string& filepath, std::size_t& data_offset) {
+    hid_t file_id = H5Fopen(filepath.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file_id < 0) return false;
+
+    hid_t dset_id = H5Dopen2(file_id, "data", H5P_DEFAULT);
+    if (dset_id < 0) {
+        H5Fclose(file_id);
+        return false;
+    }
+
+    bool ok = false;
+    hid_t dcpl_id = H5Dget_create_plist(dset_id);
+    hid_t space_id = H5Dget_space(dset_id);
+    hid_t type_id = H5Dget_type(dset_id);
+
+    hsize_t dims[2] = {0, 0};
+    int ndims = H5Sget_simple_extent_ndims(space_id);
+    if (ndims == 2) {
+        H5Sget_simple_extent_dims(space_id, dims, nullptr);
+    }
+
+    H5D_layout_t layout = H5Pget_layout(dcpl_id);
+    haddr_t offset = H5Dget_offset(dset_id);
+    bool is_float64_le = H5Tequal(type_id, H5T_IEEE_F64LE) > 0;
+
+    if (layout == H5D_CONTIGUOUS &&
+        offset != HADDR_UNDEF &&
+        ndims == 2 &&
+        dims[0] == LAT_SIZE &&
+        dims[1] == LON_SIZE &&
+        is_float64_le) {
+        data_offset = static_cast<std::size_t>(offset);
+        ok = true;
+    }
+
+    H5Tclose(type_id);
+    H5Sclose(space_id);
+    H5Pclose(dcpl_id);
+    H5Dclose(dset_id);
+    H5Fclose(file_id);
+    return ok;
+}
+
 static void set_var_chunk_cache_if_possible(int /*ncid*/, int /*varid*/) {
     // Disabled: nc_set_var_chunk_cache causes HDF5 threading issues
     // with OpenMP parallel reads on this platform.
@@ -184,6 +256,8 @@ static SSTReadInfo inspect_sst_file(const std::string& filepath) {
 
     info.has_offset = false;
     info.add_offset = 0.0;
+    info.raw_data_read = false;
+    info.raw_data_offset = 0;
 
     int ncid = -1;
     int varid = -1;
@@ -231,6 +305,19 @@ static SSTReadInfo inspect_sst_file(const std::string& filepath) {
     info.has_offset = get_att_double(ncid, varid, "add_offset", info.add_offset);
 
     nc_close(ncid);
+
+    std::size_t raw_offset = 0;
+    info.raw_data_read = (info.layout == DATA_LAT_LON &&
+                          !info.has_fill &&
+                          !info.has_missing &&
+                          !info.has_scale &&
+                          !info.has_offset &&
+                          inspect_raw_hdf5_data(filepath, raw_offset));
+    info.raw_data_offset = raw_offset;
+
+    std::cout << "[I/O module] raw HDF5 data path: "
+              << (info.raw_data_read ? "enabled" : "disabled")
+              << ", offset=" << info.raw_data_offset << std::endl;
     return info;
 }
 
@@ -288,10 +375,52 @@ static void fill_slot_nan(float* h_sst_data, int slot) {
     }
 }
 
+static bool read_full_at(int fd, void* buffer, std::size_t bytes, std::size_t offset) {
+    char* out = static_cast<char*>(buffer);
+    std::size_t done = 0;
+    while (done < bytes) {
+        ssize_t n = pread(fd, out + done, bytes - done,
+                          static_cast<off_t>(offset + done));
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
 static bool read_one_file_into_slot(const std::string& filepath,
                                     int slot,
                                     const SSTReadInfo& info,
                                     float* h_sst_data) {
+    size_t slot_offset = static_cast<size_t>(slot) * SPATIAL_POINTS;
+
+    if (info.raw_data_read) {
+        int fd = open(filepath.c_str(), O_RDONLY);
+        if (fd < 0) {
+            fill_slot_nan(h_sst_data, slot);
+            return false;
+        }
+
+        std::vector<double> tmp_double(SPATIAL_POINTS);
+        const std::size_t data_bytes = SPATIAL_POINTS * sizeof(double);
+        bool ok = read_full_at(fd, tmp_double.data(), data_bytes, info.raw_data_offset);
+        close(fd);
+
+        if (!ok) {
+            fill_slot_nan(h_sst_data, slot);
+            return false;
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (long long i = 0; i < static_cast<long long>(SPATIAL_POINTS); ++i) {
+            h_sst_data[slot_offset + i] = static_cast<float>(tmp_double[i]);
+        }
+        return true;
+    }
+
     int ncid = -1;
     int varid = -1;
 
@@ -310,9 +439,7 @@ static bool read_one_file_into_slot(const std::string& filepath,
 
     set_var_chunk_cache_if_possible(ncid, varid);
 
-    size_t slot_offset = static_cast<size_t>(slot) * SPATIAL_POINTS;
-
-    // Read as double first (data files are float64), then convert to float
+    // Read as double first (data files are float64), then convert to float.
     std::vector<double> tmp_double(SPATIAL_POINTS);
 
     if (info.layout == DATA_LAT_LON) {
@@ -402,14 +529,7 @@ void read_netcdf_parallel_for_doy(float* h_sst_data, int target_doy) {
     std::string inspect_file = input_dir + "19910101";
     SSTReadInfo info = inspect_sst_file(inspect_file);
 
-    int io_threads = IO_THREADS;
-#ifdef _OPENMP
-    int max_threads = omp_get_max_threads();
-    if (io_threads <= 0) {
-        io_threads = 1;
-    }
-    io_threads = std::min(io_threads, max_threads);
-#endif
+    int io_threads = runtime_io_threads();
 
     std::cout << "[I/O 模块] 开始读取 doy=" << target_doy
               << "，样本数=" << dates.size()
@@ -447,6 +567,7 @@ static std::string date_for_year_doy_offset(int year, int doy, int offset) {
 }
 
 void initialize_window(float* h_sst_data, int first_doy) {
+    auto t0 = std::chrono::steady_clock::now();
     std::string input_dir = with_trailing_slash(NC_INPUT_DIR);
 
     // 缓存文件元信息（只需检查一次）
@@ -456,12 +577,7 @@ void initialize_window(float* h_sst_data, int first_doy) {
         g_info_cached = true;
     }
 
-    int io_threads = IO_THREADS;
-#ifdef _OPENMP
-    int max_threads = omp_get_max_threads();
-    if (io_threads <= 0) io_threads = 1;
-    io_threads = std::min(io_threads, max_threads);
-#endif
+    int io_threads = runtime_io_threads();
 
     const int window = 2 * CLIM_DELTA_DAY + 1;
     std::cout << "[I/O 模块] 初始化滑动窗口: doy=" << first_doy
@@ -482,10 +598,14 @@ void initialize_window(float* h_sst_data, int first_doy) {
     }
 
     std::cout << "[I/O 模块] 窗口初始化完成。failed=" << failed_count
-              << "/" << DAYS_TOTAL << std::endl;
+              << "/" << DAYS_TOTAL
+              << " elapsed="
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+              << "s" << std::endl;
 }
 
 void slide_window_to_next_doy(float* h_sst_data, int current_doy, int first_doy) {
+    auto t0 = std::chrono::steady_clock::now();
     std::string input_dir = with_trailing_slash(NC_INPUT_DIR);
     const int window = 2 * CLIM_DELTA_DAY + 1;
     const int next_doy = current_doy + 1;
@@ -493,12 +613,7 @@ void slide_window_to_next_doy(float* h_sst_data, int current_doy, int first_doy)
     // 循环槽位替换：因为 mean/P90 与样本顺序无关
     int replace_offset_idx = (current_doy - first_doy) % window;
 
-    int io_threads = IO_THREADS;
-#ifdef _OPENMP
-    int max_threads = omp_get_max_threads();
-    if (io_threads <= 0) io_threads = 1;
-    io_threads = std::min(io_threads, max_threads);
-#endif
+    int io_threads = runtime_io_threads();
 
     int failed_count = 0;
 
@@ -513,10 +628,11 @@ void slide_window_to_next_doy(float* h_sst_data, int current_doy, int first_doy)
         if (!ok) ++failed_count;
     }
 
-    if (failed_count > 0) {
-        std::cout << "[I/O 模块] 滑动 doy=" << next_doy
-                  << "，failed=" << failed_count << "/" << CLIM_YEARS << std::endl;
-    }
+    std::cout << "[I/O 模块] 滑动 doy=" << next_doy
+              << "，failed=" << failed_count << "/" << CLIM_YEARS
+              << " elapsed="
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+              << "s" << std::endl;
 }
 
 // 保留原来的接口：默认读取 TARGET_DOY 对应的 30年×11天窗口

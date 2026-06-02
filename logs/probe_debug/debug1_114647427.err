@@ -1,0 +1,4 @@
+main.cpp:10:10: fatal error: 'netcdf.h' file not found
+#include <netcdf.h>
+         ^~~~~~~~~~
+1 error generated when compiling for gfx906.

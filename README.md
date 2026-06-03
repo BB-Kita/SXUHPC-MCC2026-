@@ -1,229 +1,132 @@
-# MCC26_SXU - 海洋热浪阈值计算 (C++/HIP DCU 加速)
+# MCC26_SXU GPU Optimization
 
-MCC26 超算竞赛初赛参赛作品。基于 1991-2020 年海表温度融合资料，使用海光 K100 DCU 四卡并行计算海洋热浪阈值 (P90) 和气候态海温 (Mean)。
+MCC26 初赛海洋热浪阈值计算优化工程。当前版本基于 C++/HIP，在国产 K100_AI DCU 上计算 1991-2020 气候态海温 `Clim/Mean` 和海洋热浪阈值 `P90`。
 
-## 赛题概述
+目标输出为 6 月 1 日至 8 月 31 日，共 92 天。每个目标日使用前后各 5 天滑动窗口，30 年共 330 个样本。
 
-在全球气候变暖背景下，海洋热浪频发。本赛题要求基于气候基准期 (1991-2020) 的 SST 数据，计算两个核心指标：
+## 当前最佳结果
 
-- **气候态海温 (Mean)**：以每日为中心、前后各 5 天形成 11 天窗口，提取 30 年共 330 个样本，取算术平均
-- **海洋热浪阈值 (P90)**：同上 330 个样本，按升序排列后取第 90 百分位数
+运行环境：
 
-仅计算 6 月 1 日至 8 月 31 日 (DOY 152-243) 共 92 天。
+- 单节点，4 x K100_AI DCU
+- DTK 24.04.3，`gfx906`
+- 输入目录：`/public/home/achwjznh4b/Newdata`
+- 官方验证参考：`/public/home/achwjznh4b/ERA5/Climatology`
 
-### 精度要求
+92 天完整运行：
 
-- 逐日 RMSE < 1 C
-- 季度整体平均 RMSE < 2 C
+| 版本 | real | program_total | 验证 |
+| --- | ---: | ---: | --- |
+| raw HDF5 `pread` + sliding window + persistent DCU buffer + local slice upload + `fadvise`/SIMD + `IO_THREADS=32` | **16.529s** | **16.3347s** | PASS |
 
-### 硬件约束
+官方验证精度：
 
-- 最多 2 台服务器，单机 32 核 + 4 x K100 DCU
-- 运行时间限制 2 小时
+| 指标 | RMSE |
+| --- | ---: |
+| Clim | **0.0000** |
+| P90 | **0.0127** |
 
-## 验证结果
+## 输入数据特征
 
-| 指标 | 赛题要求 | 实际结果 |
-|------|---------|---------|
-| 季度整体 P90 RMSE | < 2.0 C | **0.0127 C** |
-| 季度整体 Clim RMSE | < 2.0 C | **0.0000 C** |
-| 逐日 P90 RMSE (max) | < 1.0 C | **0.0137 C** |
-| 逐日 Clim RMSE (max) | < 1.0 C | **0.000004 C** |
+输入文件位于 `/public/home/achwjznh4b/Newdata`，共 10980 个文件，覆盖 1991-2020 年逐日数据。
 
-## 性能数据
+关键特征：
 
-硬件：2 台服务器, 每台 4x K100_AI DCU (gfx906), 32 核 CPU
+- NetCDF4/HDF5 文件
+- 变量名：`data`
+- 数据类型：`double`
+- 维度：`721 x 1440`
+- 单文件约 8.3 MB
+- 数据连续存储，无 chunk/compression
+- `data` 原始偏移：`23488`
 
-### 92 天全量运行
+因此当前代码会自动探测 HDF5 数据偏移，在匹配该布局时绕过 NetCDF API，直接用 `pread` 读取原始 double buffer，再转换为 float。
 
-| 配置 | 总时间 (real) | 说明 |
-|------|--------------|------|
-| 单节点 DTK24 raw pread t32 | **24.7s** | 最优单节点配置 |
-| 双节点 t32 (各 46 天) | **24.3s** | 受限于首天全量上传 |
+## 已采用优化
 
-### DCU 计算 kernel
+1. 滑动窗口 IO
 
-| 操作 | 耗时 | 说明 |
-|------|------|------|
-| P90/Clim kernel | ~15ms | 4 DCU 并行, rows_per_gpu=181 |
-| 全量 upload (330 slots) | ~550ms | 首天 |
-| 增量 upload (30 slots) | ~60ms | 后续每天 |
-| download 结果 | ~0.35ms | |
+   首日读取 330 个样本，后续每天只读取新增的 30 个文件，覆盖最旧 slot。
 
-### IO 线程数扫描 (2 天 smoke test)
+2. raw HDF5 `pread`
 
-| 线程数 | program_total | 首天 day_total |
-|--------|--------------|---------------|
-| t1 | 22.1s | 5.82s |
-| t8 | 6.98s | 4.83s |
-| t32 | 5.17s | 3.49s |
+   对官方输入数据的连续 HDF5 布局直接读取原始 `data` 区域，减少 NetCDF/HDF5 API 开销。
 
-### 对比其他方案
+3. 多线程 IO
 
-| 版本 | 用时 | 说明 |
-|------|------|------|
-| MATLAB baseline | >16h | 单核，赛题提供 |
-| Python (多进程) | ~3min20s | 双机 64 核 |
-| Python (预加载) | ~50s | 全量数据预加载到内存 |
-| **C++/HIP DCU (本项目)** | **~24s** | 4 DCU 并行, raw pread, t32 IO |
+   默认 `IO_THREADS=32`。完整 92 天 sweep 显示 32 线程最佳：
 
-## 项目结构
+   | IO 线程数 | real | program_total |
+   | ---: | ---: | ---: |
+   | 8 | 24.414s | 24.0451s |
+   | 16 | 19.530s | 19.296s |
+   | 24 | 19.465s | 19.2192s |
+   | 32 | **17.534s** | **17.3228s** |
 
-```
-MCC26_SXU/
-├── main.cpp                  # 主程序入口
-├── io_handler.cpp/.h         # IO 模块 (NetCDF / raw pread, 滑动窗口)
-├── compute_dcu.cpp/.h        # HIP DCU 计算内核 (P90 + Clim)
-├── algo_p90.h                # P90 分位数算法
-├── config.h                  # 常量定义：维度、路径、IO 线程数等
-├── probe_hdf5_offset.cpp     # HDF5 数据偏移探测工具
-├── CMakelists.txt            # CMake 构建脚本 (hipcc)
-│
-├── run_mcc26.slurm           # 基础 Slurm 提交脚本
-├── run_mcc26_dtk24.slurm     # DTK24 编译运行
-├── run_mcc26_two_node_t32.slurm  # 双节点 t32 运行
-├── run_io_threads_sweep.slurm    # IO 线程数扫描实验
-├── run_ioopt_2days.slurm     # IO 优化 2 天 smoke test
-├── run_inc_2days.slurm       # 增量 IO 2 天测试
-├── run_debug_1day.slurm      # 调试用 1 天运行
-├── run_probe_*.slurm         # 各种探测脚本 (arch/dtk/flags/simple)
-├── run_validate_official_logic.slurm  # 官方逻辑验证
-│
-├── get_climatology.m/sh      # 赛题基准脚本
-├── clim_verification.m/sh    # 赛题验证脚本
-├── validate_official_logic.m # 官方逻辑 MATLAB 验证
-├── verify.py                 # Python RMSE 验证
-│
-├── logs/                     # 运行日志
-│   ├── probe_arch/           # 架构探测
-│   ├── probe_debug/          # 调试日志
-│   ├── probe_dtk/            # DTK 版本探测
-│   ├── probe_flags/          # 编译选项探测
-│   ├── probe_simple/         # 简单 kernel 探测
-│   ├── run_2day/             # 2 天 smoke test
-│   ├── run_2node/            # 双节点运行
-│   ├── run_full/             # 全量 92 天运行
-│   ├── run_iosweep/          # IO 线程数扫描
-│   └── run_verify/           # 验证运行
-│
-├── verification_latest/      # 最新 RMSE 验证结果
-│   ├── RMSE_P90.txt          # 季度 P90 RMSE
-│   ├── RMSE_clim.txt         # 季度 Clim RMSE
-│   ├── RMSE_P90_daily.txt    # 逐日 P90 RMSE
-│   └── RMSE_clim_daily.txt   # 逐日 Clim RMSE
-│
-├── BENCHMARK_RESULTS.md      # 详细性能数据
-└── .gitignore
-```
+4. DCU persistent buffer + 增量 H2D
 
-## 算法设计
+   首日上传 330 slots，后续每天只上传 30 slots。设备端 buffer 持久化，避免重复分配。
 
-### 计算内核 (compute_dcu.cpp)
+5. local slice upload
 
-采用混合直方图算法，避免对 330 个样本做全排序，显著降低寄存器压力：
+   H2D 只上传每张 DCU 对应纬向切片，减少无用传输。后续增量上传约 17-24 ms。
 
-| Pass | 操作 | 说明 |
-|------|------|------|
-| 1 | 扫描 | 计算 mean、min、max，过滤 NaN |
-| 2 | 粗直方图 | 64-bin 直方图，定位目标 rank 所在 bin |
-| 3 | 自适应收集 | 从目标 bin 向两侧扩展，收集 rank 附近的值到 buffer (max 120) |
-| 4 | 插入排序 | 对 buffer 排序，精确插值得 P90 |
+6. `posix_fadvise` + SIMD conversion
 
-**数据布局**: `data[day * spatial_points + spatial_idx]`，同一 warp 内 consecutive threads 读 consecutive spatial_idx，实现合并访存。
+   对 raw `pread` 路径提示顺序读取，并对 double-to-float 转换使用 OpenMP SIMD。当前 best 由该版本产生。
 
-### 多卡并行
+## 已评估但未采用
 
-- 4 张 DCU 按 lat 行切分 (721 行 / 4 卡)
-- persistent DCU buffers，避免重复分配设备内存
-- 使用 HIP Stream 异步调度，kernel 并行执行
-- 结果通过 `hipMemcpyAsync` 回传，pin memory 对接 PCIe
+| 方向 | 结论 |
+| --- | --- |
+| CPU prefetch 与 kernel overlap | 完整 92 天 `real 22.928s`，受 CPU/文件系统竞争影响，慢于同步滑动读取 |
+| `mmap` | microbenchmark 慢于 `pread`，不集成 |
+| 每 IO 线程复用 scratch buffer | 完整 92 天 `real 18.508s`，慢于当前 best，已回退 |
+| 双节点均分 92 天 | `real` 约 24.3s，受首日全量上传和调度影响，当前不如单节点 best |
 
-### IO 优化
+## 主要文件
 
-- **增量滑动窗口**：避免每天重读 330 个文件，仅滑动更新 30 个
-- **raw HDF5 pread**：绕过 NetCDF 库开销，直接 pread 原始 HDF5 数据
-- **多线程 IO (t32)**：并行读取窗口文件，首天初始化加速 40%
-- 自动检测数据维度布局 (lat-lon / lon-lat)，必要时转置
-- 处理 `_FillValue`、`missing_value`、`scale_factor`、`add_offset`
-- 365 天日历 (剔除 2 月 29 日)
+| 文件 | 说明 |
+| --- | --- |
+| `main.cpp` | 主流程，DOY 范围控制、滑动窗口、DCU 调度、输出 |
+| `io_handler.cpp/.h` | NetCDF/raw HDF5 输入、滑动窗口 IO、raw offset 探测 |
+| `compute_dcu.cpp/.h` | HIP/DCU kernel 与 4 卡调度 |
+| `algo_p90.h` | P90 计算逻辑 |
+| `config.h` | 网格尺寸、样本数、输入路径、IO 线程数 |
+| `bench_mmap_vs_pread.cpp` | `mmap` 与 `pread` IO microbenchmark |
+| `run_mcc26_dtk24.slurm` | 单节点 92 天主运行脚本 |
+| `run_ioopt_2days.slurm` | 2 天 smoke test |
+| `run_full_io_threads_sweep.slurm` | 92 天 IO 线程数 sweep |
+| `run_validate_official_logic.slurm` | 官方验证逻辑封装 |
 
-### 双节点分片
+## 运行
 
-- 92 天对半分 (DOY 152-197 / 198-243)
-- 各节点独立计算，无需节点间通信
-- `srun` 分配到不同节点，各跑 46 天
-
-## 构建与运行
-
-### 依赖
-
-- 海光 DTK 24.04 (hipcc 编译器)
-- NetCDF-C 库
-- OpenMP
-- conda `lsd` 环境
-
-### 编译
+单节点完整运行：
 
 ```bash
-source /public/home/fujiake/miniconda3/bin/activate
-conda activate lsd
-
-mkdir -p build && cd build
-cmake ..
-make -j
-
-# 或手动编译
-hipcc -std=c++17 -O3 -fopenmp \
-    main.cpp io_handler.cpp compute_dcu.cpp \
-    -I. -I${CONDA_PREFIX}/include \
-    -L${CONDA_PREFIX}/lib -lnetcdf \
-    -Wl,-rpath,${CONDA_PREFIX}/lib \
-    -o build/mcc_baseline_inc
+sbatch --export=ALL,MCC_IO_THREADS=32 run_mcc26_dtk24.slurm
 ```
 
-### 提交作业
+2 天 smoke test：
 
 ```bash
-# 单节点全量运行
-sbatch run_mcc26_dtk24.slurm
-
-# 双节点运行
-sbatch run_mcc26_two_node_t32.slurm
-
-# IO 线程数扫描
-sbatch run_io_threads_sweep.slurm
+sbatch --export=ALL,MCC_IO_THREADS=32 run_ioopt_2days.slurm
 ```
 
-### 验证结果
+官方逻辑验证：
 
 ```bash
-# Python 验证
-python verify.py
-
-# MATLAB 官方验证
-matlab -nodisplay -nosplash -nodesktop < validate_official_logic.m
+sbatch --export=ALL, \
+  MCC_REF_CLIM_PATH=/public/home/achwjznh4b/ERA5/Climatology, \
+  MCC_CONTESTANT_CLIM_PATH=/path/to/output, \
+  MCC_VERIFY_SAVE_PATH=/path/to/verification \
+  run_validate_official_logic.slurm
 ```
 
-## 配置参数
+## 后续方向
 
-在 `config.h` 中修改：
+当前主要瓶颈仍在 IO 和 H2D。优先考虑：
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `LON_SIZE` | 1440 | 经度网格数 |
-| `LAT_SIZE` | 721 | 纬度网格数 |
-| `CLIM_START_YEAR` | 1991 | 气候基准期起始年 |
-| `CLIM_END_YEAR` | 2020 | 气候基准期结束年 |
-| `CLIM_DELTA_DAY` | 5 | 前后延伸天数 |
-| `NC_INPUT_DIR` | `/public/home/achwjznh4b/Newdata/` | 输入数据目录 |
-| `IO_THREADS` | 32 | IO 并行线程数 |
-
-## 比赛关键时间
-
-- 提交截止：**2026 年 6 月 15 日 - 6 月 21 日**
-
-## 参考资源
-
-- 赛题网址：https://www.paratera.com/event_detail/1.html
-- 海光 DCU 命令：`hy-smi`、`rocm-smi`、`rocminfo`
-- 验证数据集：`~/data` 目录下
+- 更细粒度的 H2D 与 kernel overlap，避免 CPU prefetch 与 IO 线程争用
+- slot layout 与 GPU 访问模式进一步协同
+- 只在有明确收益时再尝试异步双缓冲，避免额外同步和文件系统竞争

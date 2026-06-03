@@ -227,6 +227,31 @@ int main() {
     }
 
     // 1. 分配主机内存
+    int target_doy_begin = TARGET_DOY_BEGIN;
+    int target_doy_end = TARGET_DOY_END;
+    if (const char* begin_env = std::getenv("MCC_TARGET_DOY_BEGIN")) {
+        int requested_begin = std::atoi(begin_env);
+        if (requested_begin >= TARGET_DOY_BEGIN && requested_begin <= TARGET_DOY_END) {
+            target_doy_begin = requested_begin;
+        }
+    }
+    if (const char* end_env = std::getenv("MCC_TARGET_DOY_END")) {
+        int requested_end = std::atoi(end_env);
+        if (requested_end >= TARGET_DOY_BEGIN && requested_end <= TARGET_DOY_END) {
+            target_doy_end = requested_end;
+        }
+    }
+    if (target_doy_begin > target_doy_end) {
+        std::cerr << "ERROR: invalid target DOY range "
+                  << target_doy_begin << ".." << target_doy_end << std::endl;
+        return 1;
+    }
+    std::cout << "[experiment] output_dir=" << output_dir << std::endl;
+    if (target_doy_begin != TARGET_DOY_BEGIN || target_doy_end != TARGET_DOY_END) {
+        std::cout << "[experiment] target DOY range="
+                  << target_doy_begin << ".." << target_doy_end << std::endl;
+    }
+
     float* h_sst_data = nullptr;
     size_t memory_bytes = TOTAL_ELEMENTS * sizeof(float);
     std::cout << "[主线程] 正在分配 " << memory_bytes / (1024.0 * 1024.0 * 1024.0)
@@ -246,26 +271,6 @@ int main() {
     HIP_CHECK(hipHostMalloc(&h_p90,  SPATIAL_POINTS * sizeof(float), hipHostMallocDefault));
     std::memset(h_mean, 0, SPATIAL_POINTS * sizeof(float));
     std::memset(h_p90, 0, SPATIAL_POINTS * sizeof(float));
-
-    int target_doy_begin = TARGET_DOY_BEGIN;
-    int target_doy_end = TARGET_DOY_END;
-    if (const char* begin_env = std::getenv("MCC_TARGET_DOY_BEGIN")) {
-        int requested_begin = std::atoi(begin_env);
-        if (requested_begin >= TARGET_DOY_BEGIN && requested_begin <= TARGET_DOY_END) {
-            target_doy_begin = requested_begin;
-        }
-    }
-    if (const char* end_env = std::getenv("MCC_TARGET_DOY_END")) {
-        int requested_end = std::atoi(end_env);
-        if (requested_end >= TARGET_DOY_BEGIN && requested_end <= TARGET_DOY_END) {
-            target_doy_end = requested_end;
-        }
-    }
-    std::cout << "[experiment] output_dir=" << output_dir << std::endl;
-    if (target_doy_begin != TARGET_DOY_BEGIN || target_doy_end != TARGET_DOY_END) {
-        std::cout << "[experiment] target DOY range="
-                  << target_doy_begin << ".." << target_doy_end << std::endl;
-    }
 
     // 3. 初始化滑动窗口（读取第一个 DOY 的全部 330 个文件）
     auto phase_t0 = Clock::now();

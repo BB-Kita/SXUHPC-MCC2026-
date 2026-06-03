@@ -30,7 +30,7 @@ static constexpr std::size_t TOTAL_ELEMENTS = SPATIAL_POINTS * DAYS_TOTAL;
 // I/O 配置
 #define NC_INPUT_DIR "/public/home/achwjznh4b/Newdata/"
 #define DEFAULT_TARGET_DOY TARGET_DOY_BEGIN
-#define IO_THREADS 1
+#define IO_THREADS 32
 #define APPLY_SCALE_OFFSET 1
 
 // 统一的 HIP 错误检查宏

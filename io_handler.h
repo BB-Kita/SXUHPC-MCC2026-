@@ -17,4 +17,7 @@ void initialize_window(float* h_sst_data, int first_doy);
 // 滑动窗口：滑动 — 读取 30 个新文件，覆盖最旧的循环槽位
 void slide_window_to_next_doy(float* h_sst_data, int current_doy, int first_doy);
 
+void prefetch_next_doy_async(float* h_sst_data, int current_doy, int first_doy);
+void wait_for_prefetch_next_doy();
+
 #endif

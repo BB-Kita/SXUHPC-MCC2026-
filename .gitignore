@@ -1,0 +1,12 @@
+output*/
+logs/
+logs_*/
+build/
+verification*/
+core.*
+*.o
+*.out
+*.err
+*.exe
+*.obj
+*.tar

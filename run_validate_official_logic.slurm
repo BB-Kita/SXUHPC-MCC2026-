@@ -6,12 +6,13 @@
 #SBATCH --exclusive
 #SBATCH --gres=dcu:1
 #SBATCH --time=02:00:00
-#SBATCH -o /public/home/fujiake/fjk/MCC26_SXU_two_node_exp_20260603/logs/verify_%j.out
-#SBATCH -e /public/home/fujiake/fjk/MCC26_SXU_two_node_exp_20260603/logs/verify_%j.err
+#SBATCH -o logs/verify_%j.out
+#SBATCH -e logs/verify_%j.err
 
 set -euo pipefail
 
-WORK_DIR="${MCC_WORK_DIR:-/public/home/fujiake/fjk/MCC26_SXU_two_node_exp_20260603}"
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+WORK_DIR="${MCC_WORK_DIR:-${SCRIPT_DIR}}"
 cd "${WORK_DIR}"
 
 export PATH=/public/home/achwjznh4b/install//bin:$PATH
